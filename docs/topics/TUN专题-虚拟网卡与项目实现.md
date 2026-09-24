@@ -356,6 +356,102 @@ tun_worker.read(明文IP包)                      ← 第一层之后：包已�
 - **客户端**：都用平台 VPN API（macOS/iOS 的 NetworkExtension/`utun`、Android 的 `VpnService`），应用只拿 fd、不碰路由；macOS/iOS 靠服务顺序定默认路由，Android 靠 netd 的 fwmark + 多表。
 - **无 root**：Linux 必须 `CAP_NET_ADMIN`（root/`setcap`），否则 `TUNSETIFF` 失败；三个客户端因系统代劳而天然无需 root。
 
+#### 2.4.10 完整往返与回程路径（wg 经 TUN 访问真实内容后，应答如何回到请求方）
+
+2.4.1~2.4.9 把「出站方向的引流」讲透了，但「应答怎么回来」只一笔带过。本节把**一次完整请求—应答往返**的每一跳补齐，并重点解释「服务端回程四件套」。
+
+**一次完整往返（以「客户端经 wg 上公网」为例）：**
+
+```text
+[客户端]                               [服务端 / 网关]                         [公网目标]
+app → 明文(dst=8.8.8.8)
+  → FIB 命中 wg0 路由（AllowedIPs 推导）
+  → TUN fd → wireguard-rs 读 → 加密 → UDP(src=客户端公网IP, dst=服务端公网IP)
+                                          → 服务端收 UDP → 解密 → 内层明文(dst=8.8.8.8)
+                                                                            （见下文「回程四件套」）
+                                          服务端按自身默认路由把内层包发向公网
+                                                                        → 8.8.8.8 收到，回包(dst=服务端公网IP)
+                                          服务端收回应 → conntrack 反查 NAT → 内层 dst 还原为客户端 wg IP(10.0.0.2)
+                                          → 加密(按 cryptokey route 选客户端 peer) → UDP 回客户端
+  ← 客户端收 UDP → 解密 → 内层(dst=10.0.0.2) → 写回 TUN wg0 → 内核路由给本地 app socket ✓
+```
+
+**回程四件套（服务端要让应答能回来，必须满足）：**
+
+| 条件 | 作用 | 不配的后果 |
+|---|---|---|
+| `net.ipv4.ip_forward=1` | 允许内核**转发**解密后的内层包到真实出口（否则包到服务端就被丢弃，上不了网） | 内层包被丢弃，客户端「连得上服务端但上不了网」 |
+| `MASQUERADE` / `SNAT`（`iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE`，靠 conntrack） | 把内层源 IP（客户端 wg IP，如 `10.0.0.2`，**公网不可路由**）改写成服务端公网 IP，使公网主机能正确回包；conntrack 记住映射，回包时自动还原 | 公网主机收到源为 `10.0.0.2` 的包，回包发往 `10.0.0.2`（公网不可达）→ 请求「有去无回」 |
+| `AllowedIPs` 的**双重角色** | ① **收包过滤器**：只接受源 IP 落在 peer 的 `AllowedIPs` 内的解密包；② **回程路由选择器**：发送时 FIB 到 wg0 的路由正是由它推导，决定内层包「加密后发给哪个 peer」 | 角色①防假冒；角色②保证回包能被 cryptokey route 正确选到客户端 peer |
+| `rp_filter`（反向路径过滤）置 `0` 或 `2`(loose) | 否则内核会丢弃「从 wg0 进来、但源地址不属于 wg0 直连子网」的包（严格 RPF 误杀） | 回包内层源是公网地址、目的经 NAT 后才对，严格 RPF 直接丢 |
+
+> 出处：WireGuard 社区「forwarding / NAT」文档与多篇实测一致——`ip_forward` 与 `MASQUERADE`/`rp_filter` 通常需写在 wg-quick 的 `PostUp`（或手动 `sysctl`/`iptables`）里补齐；wg-quick 自身在用到 fwmark 时会设 `net.ipv4.conf.all.src_valid_mark=1`。
+
+**两种模式：NAT 模式 vs 路由模式**
+
+- **NAT 模式（客户端 → 公网，最常见）**：客户端只有 wg IP，服务端做 MASQUERADE 当 NAT 网关。上面四件套全部需要。对应 `AllowedIPs = 0.0.0.0/0`（全隧道）。
+- **路由模式（站点到站点 / split tunnel）**：两端都是真实可路由子网（如 `10.0.1.0/24` ↔ `10.0.2.0/24`），**不需要 NAT**——各自靠 `AllowedIPs` 通告可达子网，回程走正常路由即可；`ip_forward=1` 仍需要（服务端要转发），`MASQUERADE`/`rp_filter` 视拓扑而定（同段内可省 NAT）。
+
+> 注意：这些「转发 / NAT / rp_filter」都是**服务端（或网关端）**的主机网络配置，**wireguard-rs 本身不碰**（见 2.4.5）——它只负责加解密与 TUN 读写。配置靠 wg-quick / 你的 `PostUp` 脚本。§5 的 Mermaid 图已经画出了「入站写回 TUN → 内核路由给 APP」这一反向环节。
+
+#### 2.4.11 WireGuard 为什么用 UDP，且数据面「故意不重传」
+
+WireGuard 的传输层是 **UDP**（不是 TCP）。下面讲清「用 UDP 要不要重发」——结论：**数据报文隧道层不重传；只有握手报文会被重传；persistent keepalive 不是重传。**
+
+**UDP 协议本身不提供重传：** TCP 自带序列号、确认、超时重传、滑动窗口；UDP 是「发完即忘」，不保序、不保达、不重传。所以「用 UDP 要不要重发」的答案是：**UDP 不会替你重发，要不要重传由上层应用自己决定。**
+
+**WireGuard 的数据面：故意不重传（且不缓存、不排序）：** 加密后的 IP 包被装进 UDP datagram 发出，**丢了就是丢了，隧道层不重传、不缓存、不排序**。这是刻意设计，三条工程理由：
+
+1. **避免双重重传 / 拥塞崩溃**：隧道里跑的大概率是 TCP。若隧道层也重传、内层 TCP 也重传，网络一抖就指数级叠加，打爆链路。把可靠性完全交给内层协议最干净。
+2. **避免队头阻塞（HOL blocking）**：隧道层若做重传+重排，一个丢包会卡住后面所有包，延迟暴涨。WireGuard 选择「丢就丢」，让内层协议自己感知、自己恢复，延迟更稳。
+3. **保持无状态 / 极简**：重传需维护每会话发送缓冲、重排窗口、RTT 估计——正是 WireGuard 想甩掉的包袱（对比 OpenVPN/IPSec 的复杂度）。
+
+> 推论：**UDP 内层若是 TCP**（绝大多数上网流量），隧道不重传没问题；**UDP 内层若是 UDP**（如 DNS、QUIC、音视频），那就是端到端自己负责，隧道更不插手。
+
+**什么情况下「会重发」——只有握手（控制面）：** 握手目的是「协商出对称密钥」，必须成功，所以握手 initiation 才会被重传。本项目 `src/wireguard/timers.rs` 的 `retransmit_handshake` 定时器就是干这个的（常量见 `src/wireguard/constants.rs`）：
+
+| 常量 | 值 | 含义 |
+|---|---|---|
+| `REKEY_TIMEOUT` | 5s | 发握手后等多久没响应就重发 |
+| `REKEY_ATTEMPT_TIME` | 90s | 总的握手尝试窗口 |
+| `MAX_TIMER_HANDSHAKES` | 18（=90/5） | 最多重发次数；超了就 `giving up` 并 `purge_staged_packets()` + 启动 `zero_key_material` 擦密钥 |
+
+逻辑：`send` 发出握手 → 启动 `retransmit_handshake`（5s）→ 没收到响应就重发，最多 18 次（约 90s）→ 仍失败则放弃、清缓存包、安排密钥擦除（见 2.4.12）。
+
+**persistent keepalive 不是重传：** `send_persistent_keepalive`（`KEEPALIVE_TIMEOUT=10s`、按 peer 的 `persistent_keepalive_interval` 触发，配置见 `src/configuration/config.rs` 字段：`persistent_keepalive_interval`）周期性发 1 字节空包，**目的是撑住 NAT/防火墙的 UDP 映射表项**（家用路由器 30~120s 就清映射，不清则对端回包找不到你），并可顺带触发对端主动握手。它是「心跳」，不是「补丢失的数据」。
+
+**为什么偏偏选 UDP 而非 TCP（总结）：** 无连接 → 无会话状态，重启/换 IP 都不用重建「连接」；无队头阻塞 → 单包丢失不影响其他流；小包头、易被 UDP 防火墙放行、好做负载均衡、好穿透 NAT（配 keepalive）；加密层（Poly1305）自带完整性校验，丢包/篡改直接丢弃，不需要 TCP 那套。
+
+#### 2.4.12 断线重连与密钥管理（本项目有，且无任何「证书」概念）
+
+2.4.11 讲了 UDP 数据面无重传。那么「断线了怎么重连」「多久换一次密钥」？本节落到 `src/wireguard/timers.rs` 的具体实现。
+
+**一、断线重连：有，且由定时器驱动（WireGuard 无「长连接」概念，重连 = 握手重传 + 定时换钥 + 保活）**
+
+`Timers` 结构（`src/wireguard/timers.rs` Struct：`Timers`）挂了一组定时器，关键的几个：
+
+| 定时器 / 字段 | 触发常量 | 行为 |
+|---|---|---|
+| `retransmit_handshake` | `REKEY_TIMEOUT=5s` / `MAX_TIMER_HANDSHAKES=18` | 重连核心：握手 5s 没回就重发，最多 18 次（约 90s）；失败则 `giving up` + `purge_staged_packets()` + 起 `zero_key_material` 擦密钥 |
+| `new_handshake` | `REKEY_AFTER_TIME=120s` / `REKEY_AFTER_MESSAGES`（极大） | 每 120s 或发够消息数，主动发起新握手**换新会话密钥**（前向安全） |
+| `send_persistent_keepalive` | `KEEPALIVE_TIMEOUT=10s` | 按 peer 配置的 `persistent_keepalive_interval` 发心跳，撑 NAT（见 2.4.11，非重传） |
+| `zero_key_material` | `REJECT_AFTER_TIME*3=540s` | 放弃重连后延迟擦除密钥材料 |
+| `send_keepalive` | `KEEPALIVE_TIMEOUT=10s` | 临时保活（握手失败清理用） |
+
+`Callbacks`（`send`/`recv`/`need_key`/`key_confirmed`）里的 `keep_key_fresh` 据此实现：发够 `REKEY_AFTER_MESSAGES` 或距 `keypair.birth` 超 `REKEY_AFTER_TIME`（120s）就主动换钥（`src/wireguard/timers.rs` 函数：`keep_key_fresh` 偏移：`+380~+390` 一带）。
+
+**关键点**：重连**只针对握手（控制面）**，不针对数据面。握手成功后双方有了对称密钥，之后数据面就是无状态 UDP 往来——没有「连接断了要重连」这回事，只要对端密钥仍有效、第一层路由还在，包能到就通、到不了就丢（2.4.11 已说明数据面为何不重传）。
+
+**二、证书：完全没有**
+
+整个 `src/` 检索 `Certificate` / `x509` 零命中。WireGuard 的认证模型是 **Noise IK 协议 + 原始 X25519 公钥**：
+
+- 对端身份就是一段 base64 的 **X25519 公钥**（`x25519_dalek::PublicKey`，见 `src/wireguard/peer.rs`、`timers.rs` 的 import），配置在 `AllowedIPs` / `Peer` 里；
+- 可选再加一个 **Pre-Shared Key（PSK）** 增强前向保密；
+- **没有 CA、没有 X.509、没有证书签发/校验/吊销链**。所以「证书过期导致连不上」「证书校验失败」在这套代码里根本不存在。配置用的是 `PublicKey`，不是 `Certificate`。
+
+> 对照：许多传统 VPN（IPSec/IKEv2、OpenVPN）依赖 PKI 证书体系；WireGuard 刻意去掉，换取极简、可审计、无吊销状态机的设计。代价是「公钥分发/轮换」得靠带外手段（配置文件、wg-quick、管控平台）自己管理。
+
 ---
 
 ## 3. wireguard-rs 中的 TUN 实现（项目代码）
@@ -527,6 +623,10 @@ graph LR
 | 注册 reader | `src/wireguard/wireguard.rs` 函数：`add_tun_reader` | 每 reader 一线程 |
 | 启动/关停 | `src/main.rs` 函数：`main` | `create` → `add_tun_reader` → `event` 线程 → `wait` |
 | 偏移常量 | `src/wireguard/router/mod.rs` Const：`SIZE_MESSAGE_PREFIX`=16 / `SIZE_TAG`=16 | 原地构造 transport 头 |
+| 重连定时器 | `src/wireguard/timers.rs` Struct：`Timers` / 字段：`retransmit_handshake`/`new_handshake`/`send_persistent_keepalive`/`zero_key_material` | 握手重传、定时换钥、保活、擦密钥 |
+| 重传常量 | `src/wireguard/constants.rs` Const：`REKEY_TIMEOUT`=5s / `MAX_TIMER_HANDSHAKES`=18 / `REKEY_AFTER_TIME`=120s / `KEEPALIVE_TIMEOUT`=10s | 重连与换钥节奏 |
+| 保活配置 | `src/configuration/config.rs` 字段：`persistent_keepalive_interval` | 每 peer 的 NAT 心跳间隔 |
+| 无证书模型 | `src/wireguard/peer.rs` 等 import：`x25519_dalek::PublicKey` | 用原始 X25519 公钥，无 X.509/CA |
 
 ---
 
@@ -536,6 +636,7 @@ graph LR
 - **本项目怎么做**：用 `Tun`/`Reader`/`Writer`/`Status`/`PlatformTun` 五个 trait 抽象，Linux 走真实 `ioctl` + netlink，测试走 `sync_channel` 的 dummy，二者对核心路由逻辑完全透明。
 - **数据路径**：出站 `tun_worker.read → router.send → 加密 → UDP`；入站 `UDP → router.recv → 解密 → inbound.write(TUN)`。
 - **两个优化 TODO**：Linux 单队列（`// TODO: use multi-queue for Linux`）、`void.rs` 基准实现有 bug 被注释。
+- **回程与重连**：应答回得来靠服务端「回程四件套」——`ip_forward=1`、MASQUERADE/SNAT（conntrack）、`AllowedIPs` 双重角色（收包过滤 + 回程路由）、`rp_filter` 置宽松；断线重连由 `timers.rs` 的握手重传（`REKEY_TIMEOUT=5s`、最多 18 次）与定时换钥（`REKEY_AFTER_TIME=120s`）驱动，**且仅重传握手、数据面无状态不重传**；认证用原始 X25519 公钥，**无证书/PKI**。
 - **延伸阅读**：内核文档《Universal TUN/TAP device driver》；WireGuard 白皮书（MTU/开销）；macOS `utun`、Windows `Wintun`、Rust `rust-tun` crate 的跨平台实现差异。
 
 [总目录](../sourceReader/README.md) · [上一篇](../sourceReader/10-测试dummy平台与可复现性.md)
